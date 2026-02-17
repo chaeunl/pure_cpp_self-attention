@@ -15,6 +15,23 @@ I focused on the concept of tiling and fused operation in the unit of a block.
 
 using namespace std;
 
+void read_binary_file(string file_name, float*& tensor);
+
+bool compare_tensors(const float* computed, const float* reference, size_t count, const string& name, float atol = 1e-4) {
+    float max_abs_err = 0;
+    double sum_abs_err = 0;
+    for (size_t i = 0; i < count; i++) {
+        float abs_err = fabs(computed[i] - reference[i]);
+        if (abs_err > max_abs_err) max_abs_err = abs_err;
+        sum_abs_err += abs_err;
+    }
+    float mean_abs_err = sum_abs_err / count;
+    bool pass = max_abs_err < atol;
+    cout << (pass ? "[PASS] " : "[FAIL] ") << name
+         << "  max_err=" << max_abs_err << "  mean_err=" << mean_abs_err << endl;
+    return pass;
+}
+
 typedef struct EstimatedTime {
     float mem_alloc;
     float qkv_proj;
@@ -36,7 +53,7 @@ class MultiHeadSelfAttention
         void load_state_dict(T* q, T* k, T* v, T* o, T* qb, T* kb, T* vb, T* ob);
         // T* forward(T* input_tensor);
         // vector<T> forward(T* input_tensor);
-        EstimatedTime forward(T* hidden_states);
+        EstimatedTime forward(T* hidden_states, bool verify = false, const filesystem::path& data_dir = "");
 
         size_t _batch_size;
         size_t _seq_len;
@@ -94,7 +111,7 @@ void MultiHeadSelfAttention<T>::load_state_dict(T* q, T* k, T* v, T* o, T* qb, T
 
 template<typename T>
 // T* MultiHeadSelfAttention<T>::forward(T* hidden_states)
-EstimatedTime MultiHeadSelfAttention<T>::forward(T* hidden_states)
+EstimatedTime MultiHeadSelfAttention<T>::forward(T* hidden_states, bool verify, const filesystem::path& data_dir)
 {
     auto time_stamp_1   = chrono::system_clock::now();
 
@@ -137,6 +154,24 @@ EstimatedTime MultiHeadSelfAttention<T>::forward(T* hidden_states)
 
     auto time_stamp_3   = chrono::system_clock::now();
 
+    if (verify) {
+        size_t qkv_count = _batch_size * _seq_len * _hidden_dims;
+        float* ref = new float[qkv_count];
+        read_binary_file((data_dir / "query_states").generic_string(), ref);
+        compare_tensors(query_states, ref, qkv_count, "query_states");
+        delete[] ref;
+
+        ref = new float[qkv_count];
+        read_binary_file((data_dir / "key_states").generic_string(), ref);
+        compare_tensors(key_states, ref, qkv_count, "key_states");
+        delete[] ref;
+
+        ref = new float[qkv_count];
+        read_binary_file((data_dir / "value_states").generic_string(), ref);
+        compare_tensors(value_states, ref, qkv_count, "value_states");
+        delete[] ref;
+    }
+
     // Assume that L1 cache size is 128[KB] = 2^17[B]; 1 << 17
     // Assume that we are using floating point (FP32) number format; (1 << 17) >> 2;
     // So, L1 cache could allocate memory space for 2^15[FP32].
@@ -157,7 +192,7 @@ EstimatedTime MultiHeadSelfAttention<T>::forward(T* hidden_states)
         for (size_t head_idx = 0; head_idx < _num_heads; head_idx++) {
             T* row_wise_denominator = new T[_seq_len]();
             T* row_wise_max = new T[_seq_len]; 
-            for (size_t seq_idx; seq_idx < _seq_len; seq_idx++) {
+            for (size_t seq_idx = 0; seq_idx < _seq_len; seq_idx++) {
                 row_wise_max[seq_idx] = -10000.0;
             }
 
@@ -291,6 +326,14 @@ EstimatedTime MultiHeadSelfAttention<T>::forward(T* hidden_states)
 
     auto time_stamp_6   = chrono::system_clock::now();
 
+    if (verify) {
+        size_t out_count = _batch_size * _seq_len * _hidden_dims;
+        float* ref = new float[out_count];
+        read_binary_file((data_dir / "attn_output").generic_string(), ref);
+        compare_tensors(attn_output, ref, out_count, "attn_output");
+        delete[] ref;
+    }
+
     // output projection
     // output_states(batch_size, seq_len, hidden_dims) =
     //      attn_output(batch_size, seq_len, hidden_dims) * o_proj_weight(hidden_dims, hidden_dims)
@@ -315,6 +358,14 @@ EstimatedTime MultiHeadSelfAttention<T>::forward(T* hidden_states)
     }
 
     auto time_stamp_7   = chrono::system_clock::now();
+
+    if (verify) {
+        size_t out_count = _batch_size * _seq_len * _hidden_dims;
+        float* ref = new float[out_count];
+        read_binary_file((data_dir / "output_states").generic_string(), ref);
+        compare_tensors(output_states, ref, out_count, "output_states");
+        delete[] ref;
+    }
 
     EstimatedTime est_time;
     est_time.mem_alloc  = chrono::duration_cast<chrono::milliseconds>(time_stamp_2 - time_stamp_1).count();
@@ -347,8 +398,13 @@ void read_binary_file(string file_name, float*& tensor)
     file.read((char*) tensor, file_size);
 };
 
-int main()
+int main(int argc, char* argv[])
 {
+    bool verify_mode = false;
+    for (int i = 1; i < argc; i++) {
+        if (string(argv[i]) == "--verify") verify_mode = true;
+    }
+
     bool use_random_value   = false;
 
     size_t batch_size       = 2;
@@ -406,28 +462,32 @@ int main()
 
         // model from HuggingFace hub. google-bert/bert-base-uncased.
         // hidden_states and other state tensors with (batch_size, seq_len, hidden_dims) = (2,128,768)
-        read_binary_file((cwd / "..\\bert-base-uncased\\query.weight").generic_string(), q_proj_weight);
-        read_binary_file((cwd / "..\\bert-base-uncased\\key.weight").generic_string(), k_proj_weight);
-        read_binary_file((cwd / "..\\bert-base-uncased\\value.weight").generic_string(), v_proj_weight);
-        read_binary_file((cwd / "..\\bert-base-uncased\\output.weight").generic_string(), o_proj_weight);
+        read_binary_file((cwd / "bert-base-uncased" / "params" / "query.weight").generic_string(), q_proj_weight);
+        read_binary_file((cwd / "bert-base-uncased" / "params" / "key.weight").generic_string(), k_proj_weight);
+        read_binary_file((cwd / "bert-base-uncased" / "params" / "value.weight").generic_string(), v_proj_weight);
+        read_binary_file((cwd / "bert-base-uncased" / "params" / "output.weight").generic_string(), o_proj_weight);
 
-        read_binary_file((cwd / "..\\bert-base-uncased\\query.bias").generic_string(), q_proj_bias);
-        read_binary_file((cwd / "..\\bert-base-uncased\\key.bias").generic_string(), k_proj_bias);
-        read_binary_file((cwd / "..\\bert-base-uncased\\value.bias").generic_string(), v_proj_bias);
-        read_binary_file((cwd / "..\\bert-base-uncased\\output.bias").generic_string(), o_proj_bias);
+        read_binary_file((cwd / "bert-base-uncased" / "params" / "query.bias").generic_string(), q_proj_bias);
+        read_binary_file((cwd / "bert-base-uncased" / "params" / "key.bias").generic_string(), k_proj_bias);
+        read_binary_file((cwd / "bert-base-uncased" / "params" / "value.bias").generic_string(), v_proj_bias);
+        read_binary_file((cwd / "bert-base-uncased" / "params" / "output.bias").generic_string(), o_proj_bias);
 
-        read_binary_file((cwd / "..\\bert-base-uncased\\hidden_states").generic_string(), hidden_states);
+        read_binary_file((cwd / "bert-base-uncased" / "reference" / "hidden_states").generic_string(), hidden_states);
+    }
+
+    if (verify_mode) {
+        use_random_value = false;
+        num_samples = 1;
     }
 
     MultiHeadSelfAttention<float> attn(batch_size, seq_len, num_heads, hidden_dims);
     attn.load_state_dict(q_proj_weight, k_proj_weight, v_proj_weight, o_proj_weight, q_proj_bias, k_proj_bias, v_proj_bias, o_proj_bias);
-    
-    // float* output_states = attn.forward(hidden_states);
+
+    filesystem::path data_path = filesystem::current_path() / "bert-base-uncased" / "reference";
 
     EstimatedTime est_time[num_samples];
     for (size_t idx = 0; idx < num_samples; idx++) {
-        // float* output_states = attn.forward(hidden_states);
-        est_time[idx] = attn.forward(hidden_states);
+        est_time[idx] = attn.forward(hidden_states, verify_mode, data_path);
     }
 
     return 0;
